@@ -1,9 +1,8 @@
 import os
 import time
+import json
 import numpy as np
 from numba import jit
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 
 # 定义3D移动方向（6个方向：上下左右前后）
 DIRECTIONS = np.array([(1,0,0), (-1,0,0), (0,1,0), (0,-1,0), (0,0,1), (0,0,-1)])
@@ -94,9 +93,179 @@ def create_subsea_infrastructure(shape=(30, 30, 20)):
     grid[20, 10:21, 8] = 1
     return grid
 
-# ==================== 优化的可视化渲染 ====================
+# ==================== 生成 HTML/Three.js 交互文件的核心代码 ====================
 
-def visualize_subsea_comparison():
+def export_to_threejs(grid, path, start, goal, visited, title, output_path):
+    # 提取障碍物坐标
+    obstacles = np.argwhere(grid == 1).tolist()
+    
+    # 构建数据字典
+    scene_data = {
+        "title": title,
+        "shape": list(grid.shape),
+        "start": start,
+        "goal": goal,
+        "path": path if path else[],
+        "obstacles": obstacles,
+        "stats": {
+            "path_length": len(path) if path else 0,
+            "visited_nodes": visited
+        }
+    }
+    
+    # 序列化为 JSON 字符串
+    json_data = json.dumps(scene_data)
+    
+    # 纯正的前端 HTML 模板 (包含 Three.js 和 OrbitControls)
+    html_template = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>AUV 3D Path Planning</title>
+        <style>
+            body { margin: 0; overflow: hidden; background-color: #1e1e1e; font-family: Arial, sans-serif;}
+            #ui {
+                position: absolute; top: 15px; left: 15px;
+                color: white; background: rgba(0,0,0,0.7);
+                padding: 15px; border-radius: 8px; user-select: none;
+                pointer-events: none; border: 1px solid #444;
+            }
+            #instructions {
+                position: absolute; bottom: 15px; left: 15px;
+                color: #aaa; background: rgba(0,0,0,0.5);
+                padding: 10px; border-radius: 5px; font-size: 12px; pointer-events: none;
+            }
+        </style>
+        <!-- 引入 Three.js -->
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+        <!-- 引入 轨道控制器 -->
+        <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    </head>
+    <body>
+        <div id="ui">
+            <h2 id="title" style="margin: 0 0 10px 0; font-size: 18px; color: #4dc3ff;"></h2>
+            <div id="stats" style="font-size: 14px; line-height: 1.5;"></div>
+        </div>
+        <div id="instructions">🖱️ 鼠标左键：旋转视角 | 🖱️ 鼠标右键：平移视角 | ⚙️ 滚轮：缩放</div>
+        
+        <script>
+            // === 接收 Python 传来的数据 ===
+            const SCENE_DATA = __DATA_PLACEHOLDER__;
+            
+            // 更新 UI
+            document.getElementById('title').innerText = SCENE_DATA.title;
+            document.getElementById('stats').innerHTML = `
+                📌 Map Size: ${SCENE_DATA.shape[0]} x ${SCENE_DATA.shape[1]} x ${SCENE_DATA.shape[2]} <br>
+                🔍 Visited Nodes: ${SCENE_DATA.stats.visited_nodes} <br>
+                📏 Path Length: ${SCENE_DATA.stats.path_length} <br>
+                🟢 Start: [${SCENE_DATA.start}] <br>
+                ⭐ Goal: [${SCENE_DATA.goal}]
+            `;
+
+            // === 1. 初始化 Three.js 场景 ===
+            const scene = new THREE.Scene();
+            // 设置 Z 轴向上 (贴合数学系坐标)
+            THREE.Object3D.DefaultUp.set(0, 0, 1);
+            
+            const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(-20, -20, 35); // 初始化相机位置
+            
+            const renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+            
+            // 控制器
+            const controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.target.set(SCENE_DATA.shape[0]/2, SCENE_DATA.shape[1]/2, SCENE_DATA.shape[2]/3);
+            controls.update();
+
+            // 光源
+            scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+            const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            dirLight.position.set(20, 20, 40);
+            scene.add(dirLight);
+
+            // === 2. 绘制网格线和水面 ===
+            const gridHelper = new THREE.GridHelper(SCENE_DATA.shape[0], SCENE_DATA.shape[0], 0x444444, 0x222222);
+            gridHelper.rotation.x = Math.PI / 2; // 旋转使其平行于 XY 平面
+            gridHelper.position.set(SCENE_DATA.shape[0]/2, SCENE_DATA.shape[1]/2, 0);
+            scene.add(gridHelper);
+            
+            // 水面/海平面 (Z = max Z)
+            const waterGeo = new THREE.PlaneGeometry(SCENE_DATA.shape[0], SCENE_DATA.shape[1]);
+            const waterMat = new THREE.MeshBasicMaterial({color: 0x006994, transparent: true, opacity: 0.15, side: THREE.DoubleSide});
+            const water = new THREE.Mesh(waterGeo, waterMat);
+            water.position.set(SCENE_DATA.shape[0]/2, SCENE_DATA.shape[1]/2, SCENE_DATA.shape[2]);
+            scene.add(water);
+
+            // === 3. 使用 InstancedMesh 高效渲染海量障碍物体素 ===
+            const obsGeo = new THREE.BoxGeometry(0.95, 0.95, 0.95); // 稍微缩小一点产生网格缝隙感
+            const obsMat = new THREE.MeshPhongMaterial({ color: 0x4682B4, transparent: true, opacity: 0.4 });
+            const instancedMesh = new THREE.InstancedMesh(obsGeo, obsMat, SCENE_DATA.obstacles.length);
+            
+            const dummy = new THREE.Object3D();
+            SCENE_DATA.obstacles.forEach((obs, i) => {
+                dummy.position.set(obs[0] + 0.5, obs[1] + 0.5, obs[2] + 0.5);
+                dummy.updateMatrix();
+                instancedMesh.setMatrixAt(i, dummy.matrix);
+            });
+            scene.add(instancedMesh);
+
+            // === 4. 绘制路径、起点和终点 ===
+            function createSphere(pos, color, size=0.8) {
+                const geo = new THREE.SphereGeometry(size, 16, 16);
+                const mat = new THREE.MeshPhongMaterial({ color: color });
+                const mesh = new THREE.Mesh(geo, mat);
+                mesh.position.set(pos[0] + 0.5, pos[1] + 0.5, pos[2] + 0.5);
+                scene.add(mesh);
+            }
+            
+            // 绘制起点和终点
+            createSphere(SCENE_DATA.start, 0x00FFFF, 1.2); // 青色起点
+            createSphere(SCENE_DATA.goal, 0xFFD700, 1.2);  // 金色终点
+
+            // 绘制路径线段和路径节点
+            if (SCENE_DATA.path.length > 0) {
+                const points = SCENE_DATA.path.map(p => new THREE.Vector3(p[0] + 0.5, p[1] + 0.5, p[2] + 0.5));
+                
+                // 红色的连线
+                const lineGeo = new THREE.BufferGeometry().setFromPoints(points);
+                const lineMat = new THREE.LineBasicMaterial({ color: 0xFF0000, linewidth: 2 });
+                const line = new THREE.Line(lineGeo, lineMat);
+                scene.add(line);
+                
+                // 在每个路径点画一个小圆球以增强 3D 可视度
+                SCENE_DATA.path.forEach(p => {
+                    createSphere(p, 0xFF0000, 0.2);
+                });
+            }
+
+            // === 5. 渲染循环 ===
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            });
+
+            function animate() {
+                requestAnimationFrame(animate);
+                controls.update();
+                renderer.render(scene, camera);
+            }
+            animate();
+        </script>
+    </body>
+    </html>
+    """
+    
+    # 替换占位符并保存
+    html_content = html_template.replace('__DATA_PLACEHOLDER__', json_data)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+
+
+def run_and_export():
     shape = (30, 30, 20)
     start = (2, 2, 18)   
     goal = (27, 27, 2)   
@@ -106,78 +275,41 @@ def visualize_subsea_comparison():
         g[25:30, 25:30, 0:4] = 0
         return g
 
+    # 准备地图
     grid_A = clear_start_goal(create_reef_and_minefield(shape))
     grid_B = clear_start_goal(create_subsea_infrastructure(shape))
 
-    maps =[
-        ("Scenario A: Underwater Reefs & Minefield", grid_A, '#2E8B5733'), # 半透明海绿色
-        ("Scenario B: Subsea Infrastructure & Seabed", grid_B, '#4682B444')  # 半透明钢蓝色
+    scenarios =[
+        ("Scenario A: Underwater Reefs & Minefield", grid_A, "scenario_A_interactive.html"),
+        ("Scenario B: Subsea Infrastructure & Seabed", grid_B, "scenario_B_interactive.html")
     ]
 
-    fig = plt.figure(figsize=(20, 9))
-    
-    for i, (title, grid, color_hex) in enumerate(maps):
-        print(f"\n🌊 正在规划 {title} ... (渲染Voxel体素图可能需要几秒钟)")
-        t0 = time.time()
-        path, visited = astar_3d(grid, start, goal)
-        t1 = time.time()
-        
-        if path:
-            print(f"✅ 规划完成！耗时: {(t1-t0)*1000:.2f} ms | 渲染图像中...")
-        
-        ax = fig.add_subplot(1, 2, i+1, projection='3d')
-        ax.set_title(f"{title}\nNodes visited: {visited} | Path length: {len(path)}", fontsize=13)
-        
-        # 1. 使用 Voxels (体素方块) 代替散点图
-        # 把 numpy的int数组转成bool数组给voxels用
-        bool_grid = grid.astype(bool)
-        # 给所有的障碍物方块上色（带透明度和黑边）
-        colors = np.empty(bool_grid.shape, dtype=object)
-        colors[bool_grid] = color_hex
-        ax.voxels(bool_grid, facecolors=colors, edgecolor='black', linewidth=0.2)
-        
-        if path:
-            # 2. 坐标 +0.5：因为 Voxel 方块是以 [0,1] 占据空间的，+0.5让路径完美穿过方块中心
-            path_x = np.array([p[0] for p in path]) + 0.5
-            path_y = np.array([p[1] for p in path]) + 0.5
-            path_z = np.array([p[2] for p in path]) + 0.5
-            
-            # 画出真实的3D路径
-            ax.plot(path_x, path_y, path_z, c='red', linewidth=3.5, label='AUV Trajectory')
-            ax.scatter(path_x[::5], path_y[::5], path_z[::5], c='darkred', s=20)
-            
-            # 3. 增加底部 2D 阴影投影（极大增强深度感）
-            ax.plot(path_x, path_y, np.zeros_like(path_z), c='black', linestyle='--', linewidth=1.5, alpha=0.5, label='XY Projection (Shadow)')
-            
-        # 起点终点同样 +0.5 居中
-        ax.scatter(start[0]+0.5, start[1]+0.5, start[2]+0.5, c='cyan', s=150, marker='o', edgecolors='black', label='Start', zorder=5)
-        ax.scatter(goal[0]+0.5, goal[1]+0.5, goal[2]+0.5, c='gold', s=200, marker='*', edgecolors='black', label='Goal', zorder=5)
-        
-        # 统一坐标轴视野
-        ax.set_xlim(0, shape[0])
-        ax.set_ylim(0, shape[1])
-        ax.set_zlim(0, shape[2])
-        ax.set_xlabel('X (m)'), ax.set_ylabel('Y (m)'), ax.set_zlabel('Depth (m)')
-        ax.view_init(elev=25, azim=-50) # 优化视角，略微降低仰角
-        ax.legend(loc='upper left')
-
-    plt.tight_layout()
-    
-    # 动态创建文件夹并保存图片
+    # 创建自动保存文件夹
     script_dir = os.path.dirname(os.path.abspath(__file__))
     script_name = os.path.splitext(os.path.basename(__file__))[0]
     output_dir = os.path.join(script_dir, f"{script_name}_results")
     os.makedirs(output_dir, exist_ok=True)
     
-    img_filename = 'subsea_astar_voxel_comparison.png'
-    save_path = os.path.join(output_dir, img_filename)
-    
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    
     print("-" * 50)
-    print(f"📂 文件夹已自动创建: {output_dir}")
-    print(f"📸 3D优化版(Voxel)已生成: {img_filename}")
+    print("🚀 开始 A* 路径规划并生成 Three.js 3D 交互网页 ...")
+
+    for title, grid, filename in scenarios:
+        print(f"\n🌊 正在规划 {title} ...")
+        t0 = time.time()
+        path, visited = astar_3d(grid, start, goal)
+        t1 = time.time()
+        
+        if path:
+            print(f"✅ 找到路径！耗时: {(t1-t0)*1000:.2f} ms | 准备打包成网页...")
+        
+        # 导出为 HTML
+        save_path = os.path.join(output_dir, filename)
+        export_to_threejs(grid, path, start, goal, visited, title, save_path)
+        print(f"📄 已生成: {save_path}")
+
+    print("\n🎉 全部完成！")
+    print("👉 请前往生成的文件夹中，双击 .html 文件即可在浏览器中体验丝滑的 3D 视角！")
     print("-" * 50)
 
 if __name__ == "__main__":
-    visualize_subsea_comparison()
+    run_and_export()
