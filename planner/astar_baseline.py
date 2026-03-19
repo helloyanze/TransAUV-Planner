@@ -10,12 +10,10 @@ DIRECTIONS = np.array([(1,0,0), (-1,0,0), (0,1,0), (0,-1,0), (0,0,1), (0,0,-1)])
 
 @jit(nopython=True)
 def heuristic_3d(a, b):
-    """3D曼哈顿距离作为A*启发函数h(n)"""
     return abs(a[0]-b[0]) + abs(a[1]-b[1]) + abs(a[2]-b[2])
 
 @jit(nopython=True)
 def astar_3d(grid, start, goal):
-    """3D A*核心算法（Numba加速）"""
     empty_path = [(0, 0, 0)]
     empty_path.clear()
 
@@ -68,55 +66,41 @@ def astar_3d(grid, start, goal):
                 
     return empty_path, visited_nodes
 
-# ==================== 海底复杂地图生成函数 ====================
+# ==================== 海底复杂地图生成 ====================
 
 def create_reef_and_minefield(shape=(30, 30, 20)):
-    """场景A：水下暗礁与水雷区（密集随机散布+局部聚集）"""
     grid = np.zeros(shape, dtype=np.int32)
     x_s, y_s, z_s = shape
-    
-    # 生成几十个随机簇（模拟成片的暗礁或雷区）
     for _ in range(60):
         cx, cy, cz = np.random.randint(0, x_s), np.random.randint(0, y_s), np.random.randint(0, z_s)
-        # 障碍簇的大小
         sx, sy, sz = np.random.randint(1, 4), np.random.randint(1, 4), np.random.randint(1, 3)
         grid[max(0, cx-sx):min(x_s, cx+sx), max(0, cy-sy):min(y_s, cy+sy), max(0, cz-sz):min(z_s, cz+sz)] = 1
-        
     return grid
 
 def create_subsea_infrastructure(shape=(30, 30, 20)):
-    """场景B：水下油气平台与起伏海床（复杂地形+垂直桩基）"""
     grid = np.zeros(shape, dtype=np.int32)
     x_s, y_s, z_s = shape
-    
-    # 1. 模拟起伏的海床 (利用正弦波+余弦波生成自然地貌)
     for x in range(x_s):
         for y in range(y_s):
             h = int((np.sin(x / 4.0) + np.cos(y / 3.0)) * 2 + 4) 
             h = max(0, min(h, z_s - 1))
             grid[x, y, 0:h] = 1 
-            
-    # 2. 模拟海底油气平台的垂直桩基 (从海底直通水面)
     platform_centers =[(10, 10), (10, 20), (20, 10), (20, 20)]
     for px, py in platform_centers:
         grid[px:px+2, py:py+2, :] = 1 
-        
-    # 3. 模拟悬浮的管线/横梁 (连接各桩基的横向结构)
     grid[10:21, 10, 12] = 1
     grid[10:21, 20, 12] = 1
     grid[10, 10:21, 8] = 1
     grid[20, 10:21, 8] = 1
-        
     return grid
 
-# ==================== 可视化对比测试 ====================
+# ==================== 优化的可视化渲染 ====================
 
 def visualize_subsea_comparison():
     shape = (30, 30, 20)
-    start = (2, 2, 18)   # 左上角，靠近水面
-    goal = (27, 27, 2)   # 右下角，靠近海底
+    start = (2, 2, 18)   
+    goal = (27, 27, 2)   
     
-    # 强制清空起点和终点的周围，确保可通行
     def clear_start_goal(g):
         g[0:4, 0:4, 16:20] = 0
         g[25:30, 25:30, 0:4] = 0
@@ -126,67 +110,73 @@ def visualize_subsea_comparison():
     grid_B = clear_start_goal(create_subsea_infrastructure(shape))
 
     maps =[
-        ("Scenario A: Underwater Reefs & Minefield", grid_A),
-        ("Scenario B: Subsea Infrastructure & Seabed", grid_B)
+        ("Scenario A: Underwater Reefs & Minefield", grid_A, '#2E8B5733'), # 半透明海绿色
+        ("Scenario B: Subsea Infrastructure & Seabed", grid_B, '#4682B444')  # 半透明钢蓝色
     ]
 
-    fig = plt.figure(figsize=(18, 8))
+    fig = plt.figure(figsize=(20, 9))
     
-    for i, (title, grid) in enumerate(maps):
-        print(f"\n🌊 正在规划 {title} ...")
+    for i, (title, grid, color_hex) in enumerate(maps):
+        print(f"\n🌊 正在规划 {title} ... (渲染Voxel体素图可能需要几秒钟)")
         t0 = time.time()
         path, visited = astar_3d(grid, start, goal)
         t1 = time.time()
         
         if path:
-            print(f"✅ 找到路径！耗时: {(t1-t0)*1000:.2f} ms | 路径长度: {len(path)} | 搜索节点数: {visited}")
-        else:
-            print("❌ 无解！")
-
-        ax = fig.add_subplot(1, 2, i+1, projection='3d')
-        ax.set_title(f"{title}\nNodes visited: {visited} | Path length: {len(path)}", fontsize=12)
+            print(f"✅ 规划完成！耗时: {(t1-t0)*1000:.2f} ms | 渲染图像中...")
         
-        obs_x, obs_y, obs_z = np.where(grid == 1)
-        ax.scatter(obs_x, obs_y, obs_z, c='gray', s=10, alpha=0.15, label='Obstacles/Terrain')
+        ax = fig.add_subplot(1, 2, i+1, projection='3d')
+        ax.set_title(f"{title}\nNodes visited: {visited} | Path length: {len(path)}", fontsize=13)
+        
+        # 1. 使用 Voxels (体素方块) 代替散点图
+        # 把 numpy的int数组转成bool数组给voxels用
+        bool_grid = grid.astype(bool)
+        # 给所有的障碍物方块上色（带透明度和黑边）
+        colors = np.empty(bool_grid.shape, dtype=object)
+        colors[bool_grid] = color_hex
+        ax.voxels(bool_grid, facecolors=colors, edgecolor='black', linewidth=0.2)
         
         if path:
-            path_x, path_y, path_z = zip(*path)
-            ax.plot(path_x, path_y, path_z, c='red', linewidth=3, label='AUV Trajectory')
-            ax.scatter(path_x[::5], path_y[::5], path_z[::5], c='red', s=15)
+            # 2. 坐标 +0.5：因为 Voxel 方块是以 [0,1] 占据空间的，+0.5让路径完美穿过方块中心
+            path_x = np.array([p[0] for p in path]) + 0.5
+            path_y = np.array([p[1] for p in path]) + 0.5
+            path_z = np.array([p[2] for p in path]) + 0.5
             
-        ax.scatter(start[0], start[1], start[2], c='cyan', s=150, marker='o', edgecolors='black', label='AUV Start')
-        ax.scatter(goal[0], goal[1], goal[2], c='gold', s=200, marker='*', edgecolors='black', label='Target Station')
+            # 画出真实的3D路径
+            ax.plot(path_x, path_y, path_z, c='red', linewidth=3.5, label='AUV Trajectory')
+            ax.scatter(path_x[::5], path_y[::5], path_z[::5], c='darkred', s=20)
+            
+            # 3. 增加底部 2D 阴影投影（极大增强深度感）
+            ax.plot(path_x, path_y, np.zeros_like(path_z), c='black', linestyle='--', linewidth=1.5, alpha=0.5, label='XY Projection (Shadow)')
+            
+        # 起点终点同样 +0.5 居中
+        ax.scatter(start[0]+0.5, start[1]+0.5, start[2]+0.5, c='cyan', s=150, marker='o', edgecolors='black', label='Start', zorder=5)
+        ax.scatter(goal[0]+0.5, goal[1]+0.5, goal[2]+0.5, c='gold', s=200, marker='*', edgecolors='black', label='Goal', zorder=5)
         
+        # 统一坐标轴视野
         ax.set_xlim(0, shape[0])
         ax.set_ylim(0, shape[1])
         ax.set_zlim(0, shape[2])
         ax.set_xlabel('X (m)'), ax.set_ylabel('Y (m)'), ax.set_zlabel('Depth (m)')
-        ax.view_init(elev=30, azim=-45)
+        ax.view_init(elev=25, azim=-50) # 优化视角，略微降低仰角
         ax.legend(loc='upper left')
 
-    # ================= 动态创建文件夹并保存图片 =================
     plt.tight_layout()
     
-    # 1. 获取当前正在执行的 Python 文件所在的绝对目录
+    # 动态创建文件夹并保存图片
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    # 2. 获取当前执行的 Python 脚本的名称（不带 .py 后缀），例如 'astar_baseline'
     script_name = os.path.splitext(os.path.basename(__file__))[0]
-    
-    # 3. 拼接出我们要创建的文件夹的路径，比如 'astar_baseline_results'
     output_dir = os.path.join(script_dir, f"{script_name}_results")
-    
-    # 4. 如果文件夹不存在，则自动创建它
     os.makedirs(output_dir, exist_ok=True)
     
-    # 5. 指定图片最后要保存的位置
-    img_filename = 'subsea_astar_comparison.png'
+    img_filename = 'subsea_astar_voxel_comparison.png'
     save_path = os.path.join(output_dir, img_filename)
     
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     
     print("-" * 50)
     print(f"📂 文件夹已自动创建: {output_dir}")
-    print(f"📸 3D可视化对比已生成: {img_filename}")
+    print(f"📸 3D优化版(Voxel)已生成: {img_filename}")
     print("-" * 50)
 
 if __name__ == "__main__":
