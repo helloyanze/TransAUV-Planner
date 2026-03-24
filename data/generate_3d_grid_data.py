@@ -1,170 +1,227 @@
-import os
-import json
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
+
 import numpy as np
-from numba import jit
-import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
-from matplotlib.lines import Line2D
 
-# ===================== 配置参数 =====================
-GRID_SIZE = 20          # 20×20×20网格
-TIME_STEPS = 10         # 10个时间步
-SIGNAL_THRESHOLD = 0.2  # 通信阈值
-SAFE_RADIUS = 2         # 避障安全半径（膨胀半径）
 
-# ===================== 1. 静态层（硬约束） =====================
-def generate_static_terrain(grid_size):
-    terrain = np.random.choice([0,1], (grid_size, grid_size, grid_size), p=[0.99, 0.01])
-    expanded_terrain = terrain.copy()
-    for x in range(grid_size):
-        for y in range(grid_size):
-            for z in range(grid_size):
-                if terrain[x,y,z] == 1:
-                    for dx in range(-SAFE_RADIUS, SAFE_RADIUS + 1):
-                        for dy in range(-SAFE_RADIUS, SAFE_RADIUS + 1):
-                            for dz in range(-SAFE_RADIUS, SAFE_RADIUS + 1):
-                                nx, ny, nz = x+dx, y+dy, z+dz
-                                if 0<=nx<grid_size and 0<=ny<grid_size and 0<=nz<grid_size:
-                                    expanded_terrain[nx,ny,nz] = 1
-    return expanded_terrain
+GridPoint = Tuple[int, int, int]
 
-# ===================== 2. 动态层（软约束 & 硬约束） =====================
-@jit(nopython=True)
-def generate_dynamic_current(grid_size, t):
-    u = np.zeros((grid_size, grid_size, grid_size))
-    v = np.zeros((grid_size, grid_size, grid_size))
-    w = np.zeros((grid_size, grid_size, grid_size))
-    for x in range(grid_size):
-        for y in range(grid_size):
-            for z in range(grid_size):
-                u[x,y,z] = 1.5 * np.sin(0.2*x + 0.1*t)  
-                v[x,y,z] = 1.5 * np.cos(0.2*y + 0.1*t)  
-                w[x,y,z] = 0.3 * np.sin(0.1*z + 0.05*t) 
-    return u, v, w
 
-def generate_dynamic_obstacles(grid_size, t, num_obstacles=12):
-    obstacles =[]
-    rng = np.random.RandomState(t * 10) 
-    for _ in range(num_obstacles):
-        x = (rng.randint(SAFE_RADIUS, grid_size-SAFE_RADIUS) + int(t*0.8)) % grid_size
-        y = (rng.randint(SAFE_RADIUS, grid_size-SAFE_RADIUS) + int(t*0.5)) % grid_size
-        z = rng.randint(SAFE_RADIUS, grid_size-SAFE_RADIUS)
-        obstacles.append([int(x), int(y), int(z)])
+@dataclass
+class MapConfig:
+    grid_size: int = 20
+    time_steps: int = 12
+    terrain_density: float = 0.012
+    terrain_inflation_radius: int = 2
+    safe_clearance_margin: int = 2
+    signal_warning_threshold: float = 0.30
+    signal_critical_threshold: float = 0.05
+    hard_obstacle_radius: float = 1.0
+    warning_obstacle_radius: float = 4.0
+    max_turn_angle_deg: float = 120.0
+    current_speed_scale: float = 1.5
+    vertical_current_scale: float = 0.3
+    current_speed_max: float = 2.0
+    energy_budget: float = 120.0
+    home_point: GridPoint = (1, 1, 1)
+    acoustic_beacon: GridPoint = (5, 5, 2)
+    beacon_range: float = 15.0
+    perception_range: int = 5
+    replan_interval: int = 3
+    alpha: float = 1.2
+    beta_strength: float = 0.3
+    lambda_obs: float = 0.8
+    safety_priority: float = 2.0
+    dynamic_obstacle_count: int = 10
+    random_seed: int = 7
+    start: GridPoint = (1, 1, 1)
+    goal: GridPoint = (18, 18, 18)
+    metadata: Dict[str, float] = field(default_factory=dict)
+
+    @property
+    def d_max(self) -> int:
+        return self.grid_size * 3
+
+    @property
+    def max_turn_angle_rad(self) -> float:
+        return np.deg2rad(self.max_turn_angle_deg)
+
+    def to_search_config(self) -> Dict[str, object]:
+        config = asdict(self)
+        config["S_th"] = self.signal_warning_threshold
+        config["S_crit"] = self.signal_critical_threshold
+        config["R_hard"] = self.hard_obstacle_radius
+        config["R_warn"] = self.warning_obstacle_radius
+        config["v_current_max"] = self.current_speed_max
+        config["max_turn_angle"] = self.max_turn_angle_rad
+        config["D_max"] = self.d_max
+        return config
+
+
+def euclidean_dist(a: Sequence[float], b: Sequence[float]) -> float:
+    return float(np.linalg.norm(np.asarray(a, dtype=float) - np.asarray(b, dtype=float)))
+
+
+def _inflate_binary_mask(mask: np.ndarray, radius: int) -> np.ndarray:
+    if radius <= 0:
+        return mask.copy()
+
+    inflated = mask.copy()
+    occupied = np.argwhere(mask == 1)
+    grid_size = mask.shape[0]
+
+    for x, y, z in occupied:
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                for dz in range(-radius, radius + 1):
+                    if dx * dx + dy * dy + dz * dz > radius * radius:
+                        continue
+                    nx, ny, nz = x + dx, y + dy, z + dz
+                    if 0 <= nx < grid_size and 0 <= ny < grid_size and 0 <= nz < grid_size:
+                        inflated[nx, ny, nz] = 1
+    return inflated
+
+
+def _clear_points(terrain: np.ndarray, points: Sequence[GridPoint], margin: int) -> None:
+    grid_size = terrain.shape[0]
+    for x, y, z in points:
+        for dx in range(-margin, margin + 1):
+            for dy in range(-margin, margin + 1):
+                for dz in range(-margin, margin + 1):
+                    nx, ny, nz = x + dx, y + dy, z + dz
+                    if 0 <= nx < grid_size and 0 <= ny < grid_size and 0 <= nz < grid_size:
+                        terrain[nx, ny, nz] = 0
+
+
+def generate_static_terrain(config: MapConfig) -> np.ndarray:
+    rng = np.random.default_rng(config.random_seed)
+    terrain = (
+        rng.random((config.grid_size, config.grid_size, config.grid_size)) < config.terrain_density
+    ).astype(np.uint8)
+    inflated = _inflate_binary_mask(terrain, config.terrain_inflation_radius)
+    _clear_points(
+        inflated,
+        [config.start, config.goal, config.home_point, config.acoustic_beacon],
+        config.safe_clearance_margin,
+    )
+    return inflated
+
+
+def generate_dynamic_current(config: MapConfig, t: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    gs = config.grid_size
+    x = np.arange(gs)
+    y = np.arange(gs)
+    z = np.arange(gs)
+    X, Y, Z = np.meshgrid(x, y, z, indexing="ij")
+
+    u = config.current_speed_scale * np.sin(0.2 * X + 0.12 * t)
+    v = config.current_speed_scale * np.cos(0.18 * Y + 0.09 * t)
+    w = config.vertical_current_scale * np.sin(0.15 * Z + 0.06 * t)
+    return u.astype(np.float32), v.astype(np.float32), w.astype(np.float32)
+
+
+def generate_dynamic_obstacles(config: MapConfig, t: int) -> List[GridPoint]:
+    gs = config.grid_size
+    margin = int(np.ceil(config.warning_obstacle_radius)) + 1
+    rng = np.random.default_rng(config.random_seed + 101)
+
+    bases = []
+    for _ in range(config.dynamic_obstacle_count):
+        bases.append(
+            (
+                int(rng.integers(margin, gs - margin)),
+                int(rng.integers(margin, gs - margin)),
+                int(rng.integers(margin, gs - margin)),
+            )
+        )
+
+    obstacles: List[GridPoint] = []
+    for index, (bx, by, bz) in enumerate(bases):
+        ox = int(np.clip(round(bx + 2 * np.sin(0.30 * t + index)), 0, gs - 1))
+        oy = int(np.clip(round(by + 2 * np.cos(0.22 * t + 0.5 * index)), 0, gs - 1))
+        oz = int(np.clip(round(bz + np.sin(0.12 * t + index)), 0, gs - 1))
+        point = (ox, oy, oz)
+        if euclidean_dist(point, config.start) > config.safe_clearance_margin and euclidean_dist(
+            point, config.goal
+        ) > config.safe_clearance_margin:
+            obstacles.append(point)
+
     return obstacles
 
-# ===================== 3. 约束掩码层 =====================
-@jit(nopython=True)
-def generate_signal_field(grid_size, comm_point=(5,5,2), threshold=SIGNAL_THRESHOLD):
-    signal = np.zeros((grid_size, grid_size, grid_size))
-    signal_mask = np.zeros((grid_size, grid_size, grid_size), dtype=np.float32)
-    cx, cy, cz = comm_point
-    for x in range(grid_size):
-        for y in range(grid_size):
-            for z in range(grid_size):
-                dist = np.sqrt((x-cx)**2 + (y-cy)**2 + (z-cz)**2)
-                val = np.exp(-0.08 * dist) * (1 - 0.02*z)
-                signal[x,y,z] = max(val, 0.0)
-                if signal[x,y,z] < threshold:
-                    signal_mask[x,y,z] = 100.0
-                else:
-                    signal_mask[x,y,z] = 0.0
-    return signal, signal_mask
 
-# ===================== 4. 整合时空地图 =====================
-def generate_ocean_map():
-    static_terrain = generate_static_terrain(GRID_SIZE)
-    dynamic_map =[]
-    for t in range(TIME_STEPS):
-        cur_u, cur_v, cur_w = generate_dynamic_current(GRID_SIZE, t)
-        obstacles = generate_dynamic_obstacles(GRID_SIZE, t)
-        signal, signal_mask = generate_signal_field(GRID_SIZE)
-        step_map = {
-            "time_step": t, "static_terrain": static_terrain,
-            "current_u": cur_u, "current_v": cur_v, "current_w": cur_w,
-            "dynamic_obstacles": obstacles,
-            "signal_strength": signal, "signal_mask": signal_mask,
-        }
-        dynamic_map.append(step_map)
-    return dynamic_map
+def generate_signal_field(config: MapConfig) -> np.ndarray:
+    gs = config.grid_size
+    cx, cy, cz = config.acoustic_beacon
+    x = np.arange(gs)
+    y = np.arange(gs)
+    z = np.arange(gs)
+    X, Y, Z = np.meshgrid(x, y, z, indexing="ij")
 
-# ===================== 5. [新增] 绘制 2.5D 高清静态结构图 =====================
-def generate_2_5d_snapshot(dynamic_map, t_index=0, output_path="snapshot.png"):
-    print(f"📸 正在生成 T={t_index} 时刻的 2.5D 综合观测图...")
-    step_data = dynamic_map[t_index]
-    terrain = step_data["static_terrain"]
-    grid_size = terrain.shape[0]
-    
-    fig = plt.figure(figsize=(14, 12))
-    ax = fig.add_subplot(111, projection='3d')
-    ax.set_title(f"2.5D Ocean Environment Snapshot (Time Step: {t_index})", fontsize=16, pad=20)
-    
-    # --- A. 绘制静态地形 (Voxels) ---
-    voxel_mask = terrain == 1
-    colors = np.empty(terrain.shape, dtype=object)
-    colors[voxel_mask] = '#4682B455'  # 钢蓝色 + 强透明度，防止遮挡内部
-    ax.voxels(voxel_mask, facecolors=colors, edgecolors='#333333', linewidth=0.2)
-    
-    # --- B. 绘制洋流矢量场 (Quiver 箭头) ---
-    # 抽样参数：每隔 4 个网格画一个箭头，避免变成刺猬
-    step = 4
-    x, y, z = np.meshgrid(np.arange(0, grid_size, step),
-                          np.arange(0, grid_size, step),
-                          np.arange(0, grid_size, step), indexing='ij')
-    
-    u, v, w = step_data["current_u"][x,y,z], step_data["current_v"][x,y,z], step_data["current_w"][x,y,z]
-    
-    # 坐标 +0.5，让箭头从网格的中心点射出
-    x_c, y_c, z_c = x + 0.5, y + 0.5, z + 0.5
-    
-    # 绘制矢量箭头，length 控制比例缩放
-    ax.quiver(x_c, y_c, z_c, u, v, w, color='c', length=0.4, arrow_length_ratio=0.3, alpha=0.9)
-    
-    # --- C. 绘制动态障碍物 (Scatter 红球) ---
-    dyn_obs = step_data["dynamic_obstacles"]
-    if dyn_obs:
-        dx = [p[0] + 0.5 for p in dyn_obs]
-        dy = [p[1] + 0.5 for p in dyn_obs]
-        dz =[p[2] + 0.5 for p in dyn_obs]
-        ax.scatter(dx, dy, dz, color='red', s=120, edgecolors='black', depthshade=True, zorder=10)
+    dist = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2 + (Z - cz) ** 2)
+    signal = np.exp(-0.08 * dist) * np.maximum(1 - 0.03 * Z, 0.0)
+    return np.clip(signal, 0.0, 1.0).astype(np.float32)
 
-    # --- D. 坐标轴与视角美化 ---
-    ax.set_xlim(0, grid_size)
-    ax.set_ylim(0, grid_size)
-    ax.set_zlim(0, grid_size)
-    ax.set_xlabel('X (m)')
-    ax.set_ylabel('Y (m)')
-    ax.set_zlabel('Depth (m)')
-    
-    # 设置 2.5D 俯视等距视角
-    ax.view_init(elev=25, azim=-55)
-    
-    # 自定义图例
-    legend_elements =[
-        Patch(facecolor='#4682B455', edgecolor='#333333', label='Static Terrain (Hard Constraint)'),
-        Line2D([0], [0], marker='o', color='w', label='Dynamic Obstacles (Moving)', markerfacecolor='red', markersize=12, markeredgecolor='k'),
-        Line2D([0], [0], color='cyan', lw=2, label='Ocean Current Vector (Soft Constraint)')
-    ]
-    ax.legend(handles=legend_elements, loc='upper left', bbox_to_anchor=(0.0, 1.05), fontsize=12)
-    
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300, bbox_inches='tight', transparent=False)
-    plt.close(fig)
 
-# ===================== 主程序 =====================
+def build_step_environment(
+    t: int,
+    terrain: np.ndarray,
+    signal_field: np.ndarray,
+    current_field: Tuple[np.ndarray, np.ndarray, np.ndarray],
+    obstacles_t: List[GridPoint],
+) -> Dict[str, object]:
+    return {
+        "time_step": t,
+        "terrain": terrain,
+        "current_field": current_field,
+        "obstacles_t": obstacles_t,
+        "signal_field": signal_field,
+    }
+
+
+def generate_ocean_map(config: MapConfig | None = None, save_path: str | Path | None = None):
+    config = config or MapConfig()
+    terrain = generate_static_terrain(config)
+    signal_field = generate_signal_field(config)
+
+    env_data_sequence: List[Dict[str, object]] = []
+    for t in range(config.time_steps):
+        current_field = generate_dynamic_current(config, t)
+        obstacles_t = generate_dynamic_obstacles(config, t)
+        env_data_sequence.append(
+            build_step_environment(t, terrain, signal_field, current_field, obstacles_t)
+        )
+
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(save_path, np.asarray(env_data_sequence, dtype=object), allow_pickle=True)
+
+    return env_data_sequence, config
+
+
+def summarize_environment(env_data_sequence: Sequence[Dict[str, object]], config: MapConfig) -> Dict[str, float]:
+    signal_field = env_data_sequence[0]["signal_field"]
+    terrain = env_data_sequence[0]["terrain"]
+    return {
+        "grid_size": float(config.grid_size),
+        "time_steps": float(config.time_steps),
+        "terrain_occupancy": float(np.mean(terrain)),
+        "signal_min": float(np.min(signal_field)),
+        "signal_max": float(np.max(signal_field)),
+        "signal_below_warning_ratio": float(np.mean(signal_field < config.signal_warning_threshold)),
+        "dynamic_obstacle_count": float(len(env_data_sequence[0]["obstacles_t"])),
+    }
+
+
 if __name__ == "__main__":
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    output_dir = os.path.join(script_dir, "dynamic_ocean_data")
-    os.makedirs(output_dir, exist_ok=True)
-    
-    print("⏳ 正在计算包含流场的三维海洋数据...")
-    dynamic_map_data = generate_ocean_map()
-    
-    # 1. 生成 2.5D 静态分析图 (默认渲染 T=0 时刻的第一帧)
-    img_save_path = os.path.join(output_dir, "ocean_snapshot_2_5d.png")
-    generate_2_5d_snapshot(dynamic_map_data, t_index=0, output_path=img_save_path)
-    print(f"✅ 2.5D 综合观测图已生成: {img_save_path}")
-    
-    # 2. 生成 Three.js 动态网页 (保持原有功能)
-    print("✅ 动态数据准备完毕，(Three.js网页生成逻辑已省略/与之前一致，你随时可用前面提供的代码结合使用)...")
-    print("-" * 50)
-    print("👉 请前往文件夹查看洋流、礁石与动态障碍的三重叠加图！")
+    output_path = Path(__file__).resolve().parent / "ocean_dynamic_map.npy"
+    env_data_sequence, config = generate_ocean_map(save_path=output_path)
+    summary = summarize_environment(env_data_sequence, config)
+
+    print("Dynamic ocean map generated.")
+    print(f"Saved to: {output_path}")
+    for key, value in summary.items():
+        print(f"{key}: {value:.4f}")
